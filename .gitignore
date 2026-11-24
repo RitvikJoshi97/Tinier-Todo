@@ -1,0 +1,10 @@
+build/bin
+node_modules
+frontend/dist
+.DS_Store
+# local AI agent tooling (not part of the app)
+.agents/
+_bmad/
+_bmad-output/
+.github/agents/
+build/windows/installer/tmp/
