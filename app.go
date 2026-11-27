@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,66 +15,111 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-// App struct
+// App holds the state shared by the UI bindings and the MCP server.
 type App struct {
-	ctx         context.Context
+	ctx   context.Context
+	store *Store
+
 	mcpMu       sync.Mutex
-	mcpServer   *server.SSEServer
+	mcpHTTP     *mcpHTTPServer
 	mcpSettings MCPSettings
 }
 
-// NewApp creates a new App application struct
+// mcpHTTPServer groups the HTTP server and the two MCP transports it serves.
+type mcpHTTPServer struct {
+	sse        *server.SSEServer
+	streamable *server.StreamableHTTPServer
+	stop       func(context.Context) error
+}
+
+// NewApp creates the app. It must not touch the data folder: `wails build`
+// and `wails generate` run main() to read the bindings, and opening the store
+// here would migrate the user's real data as a side effect of building.
 func NewApp() *App {
 	return &App{}
 }
 
-// startup is called when the app starts. The context is saved
-// so we can call the runtime methods
+// startup opens the data folder. Wails calls it before the UI loads, so the
+// store is ready for every call the UI makes.
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+
+	dir, err := defaultDataDir()
+	if err == nil {
+		a.store, err = NewStore(dir)
+	}
+	if err != nil {
+		log.Printf("Cannot open the data folder: %v", err)
+		_, _ = runtime.MessageDialog(ctx, runtime.MessageDialogOptions{
+			Type:    runtime.ErrorDialog,
+			Title:   "Tinier Todo can't open its data",
+			Message: fmt.Sprintf("Tinier Todo could not open %s:\n\n%v", dir, err),
+		})
+		runtime.Quit(ctx)
+		return
+	}
+
+	a.RefreshMenu()
+	a.restoreWindowPosition(loadWindowState())
 	a.initializeMCP()
-	a.startTicketFileWatcher()
+	a.startDataWatcher()
+	a.startReminders()
 }
 
-func (a *App) startTicketFileWatcher() {
-	ticketsPath, err := getDataFilePath()
-	if err != nil {
-		return
-	}
+func (a *App) shutdown(ctx context.Context) {
+	_ = a.stopMCPServer()
+}
 
-	deletedPath, err := getDeletedDataFilePath()
-	if err != nil {
-		return
-	}
-
+// startDataWatcher tells the UI to reload when any board file changes on
+// disk, whether the change came from the MCP server, from another copy of the
+// app or from someone editing the files by hand.
+func (a *App) startDataWatcher() {
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 
-		lastTicketsModTime := getFileModTime(ticketsPath)
-		lastDeletedModTime := getFileModTime(deletedPath)
-
+		last := a.dataFingerprint()
+		lastBoards := getFileModTime(a.store.boardsPath())
 		for range ticker.C {
-			currentTicketsModTime := getFileModTime(ticketsPath)
-			currentDeletedModTime := getFileModTime(deletedPath)
-
-			if currentTicketsModTime.Equal(lastTicketsModTime) && currentDeletedModTime.Equal(lastDeletedModTime) {
+			current := a.dataFingerprint()
+			if current == last {
 				continue
 			}
-
-			lastTicketsModTime = currentTicketsModTime
-			lastDeletedModTime = currentDeletedModTime
+			last = current
+			if boards := getFileModTime(a.store.boardsPath()); !boards.Equal(lastBoards) {
+				lastBoards = boards
+				a.RefreshMenu() // board names or order changed
+			}
 			runtime.EventsEmit(a.ctx, "ticketsUpdated")
 		}
 	}()
 }
 
-func getFileModTime(filePath string) time.Time {
-	info, err := os.Stat(filePath)
+func (a *App) dataFingerprint() string {
+	var b strings.Builder
+	addFile := func(path string, info fs.FileInfo) {
+		fmt.Fprintf(&b, "%s %d %d\n", path, info.ModTime().UnixNano(), info.Size())
+	}
+	if info, err := os.Stat(a.store.boardsPath()); err == nil {
+		addFile("boards.json", info)
+	}
+	_ = filepath.WalkDir(filepath.Join(a.store.Dir(), "boards"), func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".json") {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			addFile(path, info)
+		}
+		return nil
+	})
+	return b.String()
+}
+
+func getFileModTime(path string) time.Time {
+	info, err := os.Stat(path)
 	if err != nil {
 		return time.Time{}
 	}
-
 	return info.ModTime()
 }
 
@@ -86,247 +132,115 @@ func (a *App) GetVersion() string {
 	return version
 }
 
-// Greet returns a greeting for the given name
-func (a *App) Greet(name string) string {
-	return fmt.Sprintf("Hello %s, It's show time!", name)
+// ---------- boards ----------
+
+func (a *App) GetBoards() (BoardsState, error) {
+	return a.store.Boards()
 }
 
-// getDataFilePath returns the path to the tickets data file
-func getDataFilePath() (string, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
+// CreateBoard makes a board. With no columns it gets To Do, In Progress and
+// Done.
+func (a *App) CreateBoard(name string, columns []Column) (Board, error) {
+	board, err := a.store.CreateBoardWithColumns(name, columns)
+	if err == nil {
+		a.RefreshMenu()
 	}
-
-	appDataDir := filepath.Join(homeDir, ".tinier-todo")
-
-	// Create directory if it doesn't exist
-	if err := os.MkdirAll(appDataDir, 0755); err != nil {
-		return "", err
-	}
-
-	return filepath.Join(appDataDir, "tickets.json"), nil
+	return board, err
 }
 
-// getDeletedDataFilePath returns the path to the deleted tickets data file
-func getDeletedDataFilePath() (string, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-
-	appDataDir := filepath.Join(homeDir, ".tinier-todo")
-
-	// Create directory if it doesn't exist
-	if err := os.MkdirAll(appDataDir, 0755); err != nil {
-		return "", err
-	}
-
-	return filepath.Join(appDataDir, "deleted_tickets.json"), nil
+// SetBoardColumns renames, adds, removes and reorders a board's columns.
+func (a *App) SetBoardColumns(boardID string, columns []Column) (Board, error) {
+	return a.store.SetBoardColumns(boardID, columns)
 }
 
-func requireNonEmptyTicketField(ticket map[string]interface{}, fieldName string) error {
-	value, ok := ticket[fieldName].(string)
-	if !ok || strings.TrimSpace(value) == "" {
-		return fmt.Errorf("%q is required", fieldName)
-	}
-
-	return nil
+func (a *App) RenameBoard(id, name string) error {
+	return a.refreshMenuAfter(a.store.RenameBoard(id, name))
 }
 
-func validateTicketCreateInput(ticket map[string]interface{}) error {
-	for _, fieldName := range []string{"name", "description", "project"} {
-		if err := requireNonEmptyTicketField(ticket, fieldName); err != nil {
-			return err
-		}
-	}
-
-	if status, ok := ticket["status"].(string); ok && status != "" {
-		validStatuses := map[string]bool{"todo": true, "inprogress": true, "done": true}
-		if !validStatuses[status] {
-			return fmt.Errorf("invalid status %q: must be todo, inprogress, or done", status)
-		}
-	}
-
-	return nil
+func (a *App) DeleteBoard(id string) error {
+	return a.refreshMenuAfter(a.store.DeleteBoard(id))
 }
 
-func validateTicketUpdateInput(updates map[string]interface{}) error {
-	for _, fieldName := range []string{"name", "description", "project"} {
-		if value, exists := updates[fieldName]; exists {
-			text, ok := value.(string)
-			if !ok || strings.TrimSpace(text) == "" {
-				return fmt.Errorf("%q cannot be empty", fieldName)
-			}
-		}
-	}
-
-	return nil
+func (a *App) ReorderBoards(ids []string) error {
+	return a.refreshMenuAfter(a.store.ReorderBoards(ids))
 }
 
-// SaveTickets saves tickets to a JSON file
-func (a *App) SaveTickets(tickets []map[string]interface{}) error {
-	filePath, err := getDataFilePath()
-	if err != nil {
-		return fmt.Errorf("failed to get data file path: %w", err)
-	}
-
-	data, err := json.MarshalIndent(tickets, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal tickets: %w", err)
-	}
-
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write tickets file: %w", err)
-	}
-
-	return nil
+func (a *App) SetActiveBoard(id string) error {
+	return a.refreshMenuAfter(a.store.SetActiveBoard(id))
 }
 
-// LoadTickets loads tickets from the JSON file
-func (a *App) LoadTickets() ([]map[string]interface{}, error) {
-	filePath, err := getDataFilePath()
-	if err != nil {
-		return []map[string]interface{}{}, fmt.Errorf("failed to get data file path: %w", err)
+func (a *App) refreshMenuAfter(err error) error {
+	if err == nil {
+		a.RefreshMenu()
 	}
-
-	// If file doesn't exist, return empty list
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		return []map[string]interface{}{}, nil
-	}
-
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return []map[string]interface{}{}, fmt.Errorf("failed to read tickets file: %w", err)
-	}
-
-	var tickets []map[string]interface{}
-	if err := json.Unmarshal(data, &tickets); err != nil {
-		return []map[string]interface{}{}, fmt.Errorf("failed to unmarshal tickets: %w", err)
-	}
-
-	return tickets, nil
+	return err
 }
 
-// SaveDeletedTickets saves deleted tickets to a JSON file
-func (a *App) SaveDeletedTickets(tickets []map[string]interface{}) error {
-	filePath, err := getDeletedDataFilePath()
-	if err != nil {
-		return fmt.Errorf("failed to get deleted data file path: %w", err)
-	}
+// ---------- tickets ----------
 
-	data, err := json.MarshalIndent(tickets, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal deleted tickets: %w", err)
-	}
-
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write deleted tickets file: %w", err)
-	}
-
-	return nil
+func (a *App) LoadTickets(boardID string) ([]Ticket, error) {
+	return a.store.Tickets(boardID)
 }
 
-// CreateTicket adds a new ticket and persists all tickets to disk.
-func (a *App) CreateTicket(ticket map[string]interface{}) error {
-	if err := validateTicketCreateInput(ticket); err != nil {
-		return err
-	}
-
-	tickets, err := a.LoadTickets()
-	if err != nil {
-		return fmt.Errorf("failed to load tickets: %w", err)
-	}
-	tickets = append(tickets, ticket)
-	return a.SaveTickets(tickets)
+func (a *App) LoadDeletedTickets(boardID string) ([]Ticket, error) {
+	return a.store.DeletedTickets(boardID)
 }
 
-// EditTicket updates an existing ticket by its numeric id and persists changes.
-// Only the fields present in updates are overwritten.
-func (a *App) EditTicket(ticketId float64, updates map[string]interface{}) error {
-	if err := validateTicketUpdateInput(updates); err != nil {
-		return err
-	}
-
-	tickets, err := a.LoadTickets()
-	if err != nil {
-		return fmt.Errorf("failed to load tickets: %w", err)
-	}
-
-	found := false
-	for i, t := range tickets {
-		id, ok := t["id"].(float64)
-		if !ok {
-			continue
-		}
-		if id == ticketId {
-			for k, v := range updates {
-				tickets[i][k] = v
-			}
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("ticket with id %v not found", ticketId)
-	}
-
-	return a.SaveTickets(tickets)
+func (a *App) CreateTicket(boardID string, fields TicketFields) (Ticket, error) {
+	return a.store.CreateTicket(boardID, fields)
 }
 
-// MoveTicket changes the status of a ticket identified by ticketId.
-// Valid statuses are "todo", "inprogress", and "done".
-func (a *App) MoveTicket(ticketId float64, newStatus string) error {
-	validStatuses := map[string]bool{"todo": true, "inprogress": true, "done": true}
-	if !validStatuses[newStatus] {
-		return fmt.Errorf("invalid status %q: must be todo, inprogress, or done", newStatus)
-	}
-
-	tickets, err := a.LoadTickets()
-	if err != nil {
-		return fmt.Errorf("failed to load tickets: %w", err)
-	}
-
-	found := false
-	for i, t := range tickets {
-		id, ok := t["id"].(float64)
-		if !ok {
-			continue
-		}
-		if id == ticketId {
-			tickets[i]["status"] = newStatus
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("ticket with id %v not found", ticketId)
-	}
-
-	return a.SaveTickets(tickets)
+func (a *App) UpdateTicket(boardID string, id int64, fields TicketFields) (Ticket, error) {
+	return a.store.UpdateTicket(boardID, id, fields)
 }
 
-// LoadDeletedTickets loads deleted tickets from the JSON file
-func (a *App) LoadDeletedTickets() ([]map[string]interface{}, error) {
-	filePath, err := getDeletedDataFilePath()
-	if err != nil {
-		return []map[string]interface{}{}, fmt.Errorf("failed to get deleted data file path: %w", err)
-	}
+func (a *App) MoveTicket(boardID string, id int64, status string) (Ticket, error) {
+	return a.store.MoveTicket(boardID, id, status)
+}
 
-	// If file doesn't exist, return empty list
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		return []map[string]interface{}{}, nil
-	}
+// PlaceTicket moves a ticket into a column above beforeID (0 = at the bottom).
+func (a *App) PlaceTicket(boardID string, id int64, status string, beforeID int64) (Ticket, error) {
+	return a.store.PlaceTicket(boardID, id, status, beforeID)
+}
 
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return []map[string]interface{}{}, fmt.Errorf("failed to read deleted tickets file: %w", err)
-	}
+func (a *App) EditComment(boardID string, ticketID, commentID int64, text string) (Ticket, error) {
+	return a.store.EditComment(boardID, ticketID, commentID, text)
+}
 
-	var tickets []map[string]interface{}
-	if err := json.Unmarshal(data, &tickets); err != nil {
-		return []map[string]interface{}{}, fmt.Errorf("failed to unmarshal deleted tickets: %w", err)
-	}
+func (a *App) DeleteComment(boardID string, ticketID, commentID int64) (Ticket, error) {
+	return a.store.DeleteComment(boardID, ticketID, commentID)
+}
 
-	return tickets, nil
+func (a *App) AddComment(boardID string, id int64, text string) (Ticket, error) {
+	return a.store.AddComment(boardID, id, text)
+}
+
+func (a *App) DeleteTicket(boardID string, id int64) error {
+	return a.store.DeleteTicket(boardID, id)
+}
+
+func (a *App) RestoreTicket(boardID string, id int64) (Ticket, error) {
+	return a.store.RestoreTicket(boardID, id)
+}
+
+func (a *App) MoveTicketToBoard(fromBoardID string, id int64, toBoardID string) (Ticket, error) {
+	return a.store.MoveTicketToBoard(fromBoardID, id, toBoardID)
+}
+
+// ---------- drafts ----------
+
+func (a *App) GetDraft(key string) (*Draft, error) {
+	return a.store.GetDraft(key)
+}
+
+func (a *App) ListDraftKeys() ([]string, error) {
+	return a.store.DraftKeys()
+}
+
+func (a *App) SaveDraft(key string, fields map[string]string) error {
+	return a.store.SaveDraft(key, fields)
+}
+
+func (a *App) DeleteDraft(key string) error {
+	return a.store.DeleteDraft(key)
 }

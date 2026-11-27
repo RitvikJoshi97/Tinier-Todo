@@ -8,3 +8,6 @@ _bmad/
 _bmad-output/
 .github/agents/
 build/windows/installer/tmp/
+
+# the app binary from a root-level go build
+/tinier-todo
