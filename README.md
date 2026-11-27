@@ -11,6 +11,12 @@ React and TypeScript, and runs on macOS, Windows and Linux.
 |---|---|
 | ![A job-search board with its own columns, in dark mode](docs/screenshots/board-dark.png) | ![Ticket details with comments](docs/screenshots/ticket-details.png) |
 
+### See it in action
+
+| Add a ticket and drag it along | A new board from a template |
+|---|---|
+| [![Quick-adding a ticket to To Do and dragging it into In Progress (video)](docs/videos/add-and-drag.jpg)](docs/videos/add-and-drag.mp4) | [![Creating a Job search board with its own columns (video)](docs/videos/new-board.jpg)](docs/videos/new-board.mp4) |
+
 ## Download
 
 Get the latest build from the [Releases page](../../releases/latest).
